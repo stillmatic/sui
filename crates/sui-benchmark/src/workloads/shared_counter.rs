@@ -18,6 +18,7 @@ use test_utils::messages::{make_counter_create_transaction, make_counter_increme
 use test_utils::{
     messages::create_publish_move_package_transaction, transaction::parse_package_ref,
 };
+use tracing::log::info;
 
 use super::workload::{submit_transaction, Gas, Payload, Workload, WorkloadType};
 
@@ -153,7 +154,7 @@ impl Workload<dyn Payload> for SharedCounterWorkload {
             }
         }
         // create counters using gas objects we created above
-        eprintln!("Creating shared counters, this may take a while..");
+        info!("Creating shared counters, this may take a while..");
         let futures = counters_gas
             .into_iter()
             .map(|(sender, keypair, gas)| async move {

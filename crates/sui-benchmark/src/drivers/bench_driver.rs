@@ -7,6 +7,7 @@ use futures::future::try_join_all;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use futures::{stream::FuturesUnordered, StreamExt};
+use indicatif::ProgressBar;
 use prometheus::register_gauge_vec_with_registry;
 use prometheus::register_histogram_vec_with_registry;
 use prometheus::register_int_counter_vec_with_registry;
@@ -35,6 +36,8 @@ use tokio::sync::Barrier;
 use tokio::time;
 use tokio::time::Instant;
 use tracing::{debug, error};
+
+use super::Interval;
 pub struct BenchMetrics {
     pub num_success: IntCounterVec,
     pub num_error: IntCounterVec,
@@ -103,13 +106,14 @@ enum NextOp {
     Retry(RetryType),
 }
 
-async fn print_start_benchmark() {
-    static ONCE: OnceCell<bool> = OnceCell::const_new();
+async fn start_benchmark(pb: Arc<ProgressBar>) -> &'static Instant {
+    static ONCE: OnceCell<Instant> = OnceCell::const_new();
     ONCE.get_or_init(|| async move {
+        pb.finish();
         eprintln!("Starting benchmark!");
-        true
+        Instant::now()
     })
-    .await;
+    .await
 }
 
 pub struct BenchDriver {
@@ -117,6 +121,7 @@ pub struct BenchDriver {
     pub num_workers: u64,
     pub target_qps: u64,
     pub stat_collection_interval: u64,
+    pub start_time: Instant,
 }
 
 impl BenchDriver {
@@ -132,6 +137,29 @@ impl BenchDriver {
             num_workers,
             target_qps,
             stat_collection_interval,
+            start_time: Instant::now(),
+        }
+    }
+    pub fn update_progress(
+        start_time: Instant,
+        interval: Interval,
+        progress_bar: Arc<ProgressBar>,
+    ) {
+        match interval {
+            Interval::Count(count) => {
+                progress_bar.inc(1);
+                if progress_bar.position() >= count {
+                    progress_bar.finish();
+                }
+            }
+            Interval::Time(Duration::MAX) => progress_bar.inc(1),
+            Interval::Time(duration) => {
+                let elapsed_secs = (Instant::now() - start_time).as_secs();
+                progress_bar.set_position(std::cmp::min(duration.as_secs(), elapsed_secs));
+                if progress_bar.position() >= duration.as_secs() {
+                    progress_bar.finish();
+                }
+            }
         }
     }
 }
@@ -143,6 +171,8 @@ impl Driver<()> for BenchDriver {
         workload: Box<dyn Workload<dyn Payload>>,
         aggregator: AuthorityAggregator<NetworkAuthorityClient>,
         registry: &Registry,
+        show_progress: bool,
+        run_duration: Interval,
     ) -> Result<(), anyhow::Error> {
         let mut tasks = Vec::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -150,21 +180,30 @@ impl Driver<()> for BenchDriver {
         let stat_delay_micros = 1_000_000 * self.stat_collection_interval;
         let barrier = Arc::new(Barrier::new(self.num_workers as usize));
         let metrics = Arc::new(BenchMetrics::new(registry));
+        let pb = Arc::new(ProgressBar::new(self.num_workers));
+        eprintln!("Setting up workers...");
+        let progress = Arc::new(match run_duration {
+            Interval::Count(count) => ProgressBar::new(count),
+            Interval::Time(Duration::MAX) => ProgressBar::new_spinner(),
+            Interval::Time(duration) => ProgressBar::new(duration.as_secs()),
+        });
         for i in 0..self.num_workers {
-            eprintln!("Starting worker: {}", i);
-            let mut free_pool = workload
-                .make_test_payloads(self.num_requests_per_worker, &aggregator)
-                .await;
+            let progress = progress.clone();
+            let pb = pb.clone();
             let tx_cloned = tx.clone();
             let cloned_barrier = barrier.clone();
             let metrics_cloned = metrics.clone();
+            let mut free_pool = workload
+                .make_test_payloads(self.num_requests_per_worker, &aggregator)
+                .await;
+            pb.inc(1);
             // Make a per worker quorum driver, otherwise they all share the same task.
             let quorum_driver_handler =
                 QuorumDriverHandler::new(aggregator.clone(), QuorumDriverMetrics::new_for_tests());
             let qd = quorum_driver_handler.clone_quorum_driver();
             let runner = tokio::spawn(async move {
                 cloned_barrier.wait().await;
-                print_start_benchmark().await;
+                let start_time = start_benchmark(pb).await;
                 let mut num_success = 0;
                 let mut num_error = 0;
                 let mut min_latency = Duration::MAX;
@@ -297,6 +336,10 @@ impl Driver<()> for BenchDriver {
                             match op {
                                 NextOp::Retry(b) => {
                                     retry_queue.push_back(b);
+                                    BenchDriver::update_progress(*start_time, run_duration, progress.clone());
+                                    if progress.is_finished() {
+                                        break;
+                                    }
                                 }
                                 NextOp::Response(Some((start, payload))) => {
                                     let latency = start.elapsed();
@@ -311,6 +354,10 @@ impl Driver<()> for BenchDriver {
                                     }
                                     if latency < min_latency {
                                         min_latency = latency;
+                                    }
+                                    BenchDriver::update_progress(*start_time, run_duration, progress.clone());
+                                    if progress.is_finished() {
+                                        break;
                                     }
                                 }
                                 NextOp::Response(None) => {
@@ -329,6 +376,7 @@ impl Driver<()> for BenchDriver {
         tasks.push(tokio::spawn(async move {
             let mut stat_collection: BTreeMap<usize, Stats> = BTreeMap::new();
             let mut counter = 0;
+            let mut stat = "".to_string();
             while let Some(s @ Stats {
                 id,
                 num_success: _,
@@ -375,10 +423,15 @@ impl Driver<()> for BenchDriver {
                 };
                 counter += 1;
                 if counter % num_workers == 0 {
-                    eprintln!("Throughput = {}, min_latency_ms = {}, max_latency_ms = {}, num_success = {}, num_error = {}, no_gas = {}, submitted = {}, in_flight = {}", total_qps, min_latency.as_millis(), max_latency.as_millis(), num_success, num_error, num_no_gas, num_submitted, num_in_flight);
+                    stat = format!("Throughput = {}, min_latency_ms = {}, max_latency_ms = {}, num_success = {}, num_error = {}, no_gas = {}, submitted = {}, in_flight = {}", total_qps, min_latency.as_millis(), max_latency.as_millis(), num_success, num_error, num_no_gas, num_submitted, num_in_flight);
+                    if show_progress {
+                        eprintln!("{}", stat);
+                    }
                 }
             }
+            eprintln!("{}", stat);
         }));
+        drop(tx);
         let _res: Vec<_> = try_join_all(tasks).await.unwrap().into_iter().collect();
         Ok(())
     }
