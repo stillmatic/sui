@@ -10,4 +10,5 @@ edition = "2021"
 workspace-hack = { path = "../workspace-hack"}
 
 [target.'cfg(msim)'.dependencies]
-msim = { git = "https://github.com/MystenLabs/mysten-sim.git", rev = "bccf26947cc8a22cc69526f1720edde6e55a7d8c", package = "msim" }
+#msim = { git = "https://github.com/MystenLabs/mysten-sim.git", rev = "bccf26947cc8a22cc69526f1720edde6e55a7d8c", package = "msim" }
+msim = { path = "../../../mysten-sim/msim" }
