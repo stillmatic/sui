@@ -23,7 +23,8 @@ use sui_types::{
 use tracing::{debug, error, info, instrument, trace, Instrument};
 
 use prometheus::{
-    register_histogram_with_registry, register_int_counter_with_registry, Histogram, IntCounter,
+    register_histogram_with_registry, register_int_counter_vec_with_registry,
+    register_int_counter_with_registry, Histogram, IntCounter, IntCounterVec,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::string::ToString;
@@ -89,6 +90,10 @@ pub struct AuthAggMetrics {
     pub num_good_stake: Histogram,
     pub num_bad_stake: Histogram,
     pub total_quorum_once_timeout: IntCounter,
+    // track which validators respond fast enough to form the transaction certificate
+    pub validators_participating_in_tx_cert: IntCounterVec,
+    // track which validators respond fast enough to form the effects certificate
+    pub validators_participating_in_effects_cert: IntCounterVec,
 }
 
 // Override default Prom buckets for positive numbers in 0-50k range
@@ -131,6 +136,20 @@ impl AuthAggMetrics {
             total_quorum_once_timeout: register_int_counter_with_registry!(
                 "total_quorum_once_timeout",
                 "Total number of timeout when calling quorum_once_with_timeout",
+                registry,
+            )
+            .unwrap(),
+            validators_participating_in_tx_cert: register_int_counter_vec_with_registry!(
+                "validators_participating_in_tx_cert",
+                "Number of times a validator was included in tx cert",
+                &["validator"],
+                registry,
+            )
+            .unwrap(),
+            validators_participating_in_effects_cert: register_int_counter_vec_with_registry!(
+                "validators_participating_in_effects_cert",
+                "Number of times a validator was included in effects cert",
+                &["validator"],
                 registry,
             )
             .unwrap(),
@@ -1300,6 +1319,7 @@ where
                                         .observe(state.signatures.len() as f64);
                                     self.metrics.num_good_stake.observe(state.good_stake as f64);
                                     self.metrics.num_bad_stake.observe(state.bad_stake as f64);
+                                    state.signatures.iter().for_each(|(name, _)| self.metrics.validators_participating_in_tx_cert.with_label_values(&[&name.to_string()]).inc());
                                     state.certificate =
                                         Some(CertifiedTransaction::new_with_signatures(
                                             transaction_ref.clone(),
@@ -1518,6 +1538,7 @@ where
                                 entry.signatures.push((name, inner_effects.auth_signature.signature));
 
                                 if entry.stake >= threshold {
+                                    entry.signatures.iter().for_each(|(name, _)| self.metrics.validators_participating_in_effects_cert.with_label_values(&[&name.to_string()]).inc());
                                     // It will set the timeout quite high.
                                     debug!(
                                         tx_digest = ?tx_digest,
