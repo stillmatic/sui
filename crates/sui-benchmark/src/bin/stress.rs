@@ -14,6 +14,8 @@ use strum_macros::EnumString;
 use sui_benchmark::benchmark::follow;
 use sui_benchmark::drivers::bench_driver::BenchDriver;
 use sui_benchmark::drivers::driver::Driver;
+use sui_benchmark::drivers::BenchmarkCmp;
+use sui_benchmark::drivers::BenchmarkStats;
 use sui_benchmark::drivers::Interval;
 use sui_benchmark::workloads::shared_counter::SharedCounterWorkload;
 use sui_benchmark::workloads::transfer_object::TransferObjectWorkload;
@@ -109,6 +111,12 @@ struct Opts {
     /// "10000"
     #[clap(long, global = true, default_value = "unbounded")]
     pub run_duration: Interval,
+    /// Path where benchmark stats is stored
+    #[clap(long, default_value = "/tmp/bench_result", global = true)]
+    pub benchmark_stats_path: String,
+    /// Path where previous benchmark stats is stored to use for comparison
+    #[clap(long, default_value = "", global = true)]
+    pub compare_with_benchmark: String,
 }
 
 #[derive(Debug, Clone, Parser, Eq, PartialEq, EnumString)]
@@ -352,6 +360,8 @@ async fn main() -> Result<()> {
         .worker_threads(opts.num_client_threads as usize)
         .build()
         .unwrap();
+    let prev_benchmark_stats_path = opts.compare_with_benchmark.clone();
+    let curr_benchmark_stats_path = opts.benchmark_stats_path.clone();
     let handle = std::thread::spawn(move || {
         client_runtime.block_on(async move {
             let committee = GatewayState::make_committee(&gateway_config).unwrap();
@@ -403,6 +413,25 @@ async fn main() -> Result<()> {
     if let Err(err) = joined {
         Err(anyhow!("Failed to join client runtime: {:?}", err))
     } else {
-        joined.unwrap()
+        let stats: BenchmarkStats = joined.unwrap().unwrap();
+        let table = stats.to_table();
+        eprintln!("Benchmark Result");
+        eprintln!("{}", table);
+        if !prev_benchmark_stats_path.is_empty() {
+            let data = std::fs::read_to_string(&prev_benchmark_stats_path)?;
+            let prev_stats: BenchmarkStats = serde_json::from_str(&data)?;
+            let cmp = BenchmarkCmp {
+                new: &stats,
+                old: &prev_stats,
+            };
+            let cmp_table = cmp.to_table();
+            eprintln!("Benchmark Comparison Result[{}]", prev_benchmark_stats_path);
+            eprintln!("{}", cmp_table);
+        }
+        if !curr_benchmark_stats_path.is_empty() {
+            let serialized = serde_json::to_string(&stats)?;
+            std::fs::write(curr_benchmark_stats_path, serialized)?;
+        }
+        Ok(())
     }
 }
