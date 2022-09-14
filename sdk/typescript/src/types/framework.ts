@@ -21,9 +21,49 @@ export const COIN_MODULE_NAME = 'coin';
 export const COIN_TYPE = `${COIN_PACKAGE_ID}::${COIN_MODULE_NAME}::Coin`;
 export const COIN_SPLIT_VEC_FUNC_NAME = 'split_vec';
 export const COIN_JOIN_FUNC_NAME = 'join';
+export const COIN_DENOMINATIONS: Record<string, Record<string, number>> = {
+  '0x2::sui::SUI': {
+    'MIST': 1,
+    'SUI': 1e9,
+  },
+} as const;
 const COIN_TYPE_ARG_REGEX = /^0x2::coin::Coin<(.+)>$/;
 
 type ObjectData = GetObjectDataResponse | SuiMoveObject | SuiObjectInfo;
+type NumberFormatOptions = {
+  notation?: 'standard' | 'compact',
+  minimumFractionDigits?: number,
+  maximumFractionDigits?: number,
+};
+
+type DenominationData = {symbol: string, value: number};
+function getDenominationData(coinArgType: string, baseValue: bigint, denomination: 'auto' | string): DenominationData {
+  if (denomination === 'auto' && COIN_DENOMINATIONS[coinArgType]) {
+    const denominations = Object.entries(COIN_DENOMINATIONS[coinArgType]).sort(([_A, valA], [_B, valB]) => valA - valB);
+    let selectedEntry = denominations[0];
+    for (const anEntry of denominations) {
+        if (baseValue * BigInt(100) >= anEntry[1]) {
+          selectedEntry = anEntry;
+          continue;
+        }
+        break;
+    }
+    return {
+      symbol: selectedEntry[0],
+      value: selectedEntry[1],
+    };
+  }
+  if (denomination !== 'auto' && COIN_DENOMINATIONS[coinArgType]?.[denomination]) {
+    return {
+      symbol: denomination as string,
+      value: COIN_DENOMINATIONS[coinArgType][denomination] as number,
+    };
+  }
+  return {
+    symbol: Coin.getCoinSymbol(coinArgType),
+    value: 1,
+  }
+}
 
 /**
  * Utility class for 0x2::coin
@@ -69,6 +109,38 @@ export class Coin {
 
   static getZero(): BN {
     return new BN.BN('0', 10);
+  }
+
+  // XXX: there are cases where we lose precision so don't use it for calculations
+  // TODO: fix precision loss
+  static getFormatData(
+      baseValue: bigint,
+      coinArgType: string,
+      mode: 'accurate' | 'loose',
+      denomination: 'auto' | string = 'auto'
+    ): { value: number, symbol: string, formatOptions: NumberFormatOptions } {
+      const denominationData = getDenominationData(coinArgType, baseValue, denomination);
+      const adjValue = Number(baseValue) / denominationData.value;
+      const formatOptions: NumberFormatOptions = {};
+      if (mode === 'accurate') {
+        formatOptions.maximumFractionDigits = 20;
+      }
+      if (mode === 'loose') {
+        formatOptions.notation = 'compact';
+        formatOptions.maximumFractionDigits = 2;
+      }
+    return {
+      value: adjValue,
+      symbol: denominationData.symbol,
+      formatOptions,
+    };
+  }
+
+  // XXX: there are cases where we lose precision so don't use it for calculations
+  // TODO: fix precision loss
+  static fromInput(inputValue: string, denomination: number): bigint {
+    const value = parseFloat(inputValue);
+    return BigInt(Math.round(value * denomination));
   }
 
   private static getType(data: ObjectData): string | undefined {
